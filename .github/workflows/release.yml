@@ -1,0 +1,189 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 仅在推送以 v 开头的 tag 时触发 (例如 v1.0.0)
+  workflow_dispatch: # 允许在网页端手动触发
+    inputs:
+      release_tag:
+        description: '要补跑或发布的正式版本 tag，例如 v2.6.2'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        run: |
+          $releaseTag = "${{ inputs.release_tag }}"
+          if ([string]::IsNullOrWhiteSpace($releaseTag) -and "${{ github.ref_type }}" -eq "tag") {
+            $releaseTag = "${{ github.ref_name }}"
+          }
+
+          if ($releaseTag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Invalid release tag: $releaseTag"
+          }
+
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Release tag: $releaseTag"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate private core checkout secrets
+        env:
+          PRIVATE_CORE_REPOSITORY: ${{ secrets.PRIVATE_CORE_REPOSITORY }}
+          PRIVATE_CORE_ACCESS_TOKEN: ${{ secrets.PRIVATE_CORE_ACCESS_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PRIVATE_CORE_REPOSITORY)) {
+            throw "Missing PRIVATE_CORE_REPOSITORY secret. Expected format: owner/repo"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:PRIVATE_CORE_ACCESS_TOKEN)) {
+            throw "Missing PRIVATE_CORE_ACCESS_TOKEN secret. Refusing to build without private repository token."
+          }
+
+      - name: Read private core reference
+        run: |
+          $privateCoreRef = Get-Content private-core-ref.json -Raw | ConvertFrom-Json
+
+          if ([string]::IsNullOrWhiteSpace($privateCoreRef.ref)) {
+            throw "Missing `ref` in private-core-ref.json"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($privateCoreRef.ci_checkout_path)) {
+            throw "Missing `ci_checkout_path` in private-core-ref.json"
+          }
+
+          "PRIVATE_CORE_REF=$($privateCoreRef.ref)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PRIVATE_CORE_CHECKOUT_PATH=$($privateCoreRef.ci_checkout_path)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Checkout private core repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_CORE_REPOSITORY }}
+          ref: ${{ env.PRIVATE_CORE_REF }}
+          path: ${{ env.PRIVATE_CORE_CHECKOUT_PATH }}
+          token: ${{ secrets.PRIVATE_CORE_ACCESS_TOKEN }}
+
+      - name: Materialize private requirements
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PRIVATE_CORE_CHECKOUT_PATH)) {
+            throw "Missing PRIVATE_CORE_CHECKOUT_PATH from private-core-ref.json"
+          }
+
+          if (-not (Test-Path $env:PRIVATE_CORE_CHECKOUT_PATH)) {
+            throw "Private core checkout path not found: $env:PRIVATE_CORE_CHECKOUT_PATH"
+          }
+
+          if (-not (Test-Path (Join-Path $env:PRIVATE_CORE_CHECKOUT_PATH 'pyproject.toml'))) {
+            throw "Private core repository missing pyproject.toml: $env:PRIVATE_CORE_CHECKOUT_PATH"
+          }
+
+          $privateRequirementsPath = ".private-requirements.txt"
+          $normalizedCheckoutPath = $env:PRIVATE_CORE_CHECKOUT_PATH -replace '\\', '/'
+          $content = "-e ./$normalizedCheckoutPath"
+          $content | Out-File -FilePath $privateRequirementsPath -Encoding utf8 -NoNewline
+
+          if (-not (Test-Path $privateRequirementsPath)) {
+            throw "Failed to materialize .private-requirements.txt"
+          }
+
+          $materialized = Get-Content $privateRequirementsPath -Raw
+          if ([string]::IsNullOrWhiteSpace($materialized)) {
+            throw ".private-requirements.txt is empty after materialization"
+          }
+
+      - name: Install private core dependency
+        run: |
+          pip install -r .private-requirements.txt
+          pip install pyinstaller
+
+      - name: Run public shell and private core tests
+        run: |
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          python -m unittest discover -s tests -v
+          python -m unittest discover -s "$env:PRIVATE_CORE_CHECKOUT_PATH/tests" -v
+
+      - name: Inject version from tag
+        run: |
+          # Windows PowerShell 的 -Encoding utf8 会写 BOM，改用 ascii（tag 只含 ASCII）
+          $env:RELEASE_TAG | Out-File -FilePath VERSION -Encoding ascii -NoNewline
+          Write-Host "VERSION content: $(Get-Content VERSION)"
+
+      - name: Build with PyInstaller
+        run: python build.py
+        env:
+          PYTHONUTF8: "1"
+
+      - name: Smoke test frozen executable
+        timeout-minutes: 2
+        run: |
+          $smokeExecutable = (Resolve-Path "./dist/WirelessDeviceBatteryMonitor.exe").Path
+          $smokeArguments = @('--smoke-test')
+          $smokeProcess = Start-Process -FilePath $smokeExecutable -ArgumentList $smokeArguments -Wait -PassThru -WindowStyle Hidden
+          if ($smokeProcess.ExitCode -ne 0) {
+            throw "Frozen executable smoke test failed with exit code $($smokeProcess.ExitCode)"
+          }
+
+      - name: Prepare portable executable
+        run: |
+          $notesPath = Join-Path "docs/releases" "$env:RELEASE_TAG.md"
+          if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) {
+            throw "Missing release notes file: $notesPath"
+          }
+          $exeName = "WirelessDeviceBatteryMonitor-$env:RELEASE_TAG.exe"
+          Rename-Item -LiteralPath "dist/WirelessDeviceBatteryMonitor.exe" -NewName $exeName
+          "EXE_NAME=$exeName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ensure GitHub Release
+        run: |
+          gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            $notesPath = Join-Path "docs/releases" "$env:RELEASE_TAG.md"
+            gh release create "$env:RELEASE_TAG" `
+              --repo "$env:GITHUB_REPOSITORY" `
+              --target "$env:GITHUB_SHA" `
+              --title "Release $env:RELEASE_TAG" `
+              --notes-file $notesPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create GitHub Release: $env:RELEASE_TAG"
+            }
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload portable executable to GitHub
+        run: |
+          gh release upload "$env:RELEASE_TAG" "dist/$env:EXE_NAME" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release asset upload failed with exit code $LASTEXITCODE"
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Artifact (可供手动下载)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.EXE_NAME }}
+          path: dist/${{ env.EXE_NAME }}
+          if-no-files-found: error
