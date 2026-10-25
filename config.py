@@ -228,7 +228,16 @@ REG_NAME = "MouseBatteryMonitor"
 
 
 def _autostart_command(app_path: str = APP_PATH) -> str:
-    """返回可安全存入 Run 键的 Windows 命令行。"""
+    """返回可安全存入 Run 键的 Windows 命令行。
+
+    源码运行时 APP_PATH 是 .py 文件，直接写注册表会按文件关联打开
+    （默认多半是编辑器）而不是运行；必须显式用同目录 pythonw.exe
+    无窗口启动。打包 exe 场景保持原样。
+    """
+    if not getattr(sys, 'frozen', False) and app_path.lower().endswith('.py'):
+        pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+        if os.path.exists(pythonw):
+            return subprocess.list2cmdline([pythonw, app_path])
     return subprocess.list2cmdline([app_path])
 
 

@@ -45,6 +45,10 @@ pip install "winrt-runtime==3.2.1.0" \
     "winrt-Windows.Storage.Streams==3.2.1"
 
 python main.py            # 托盘常驻
+
+# 开机自启：在设置窗口勾选，或手动注册（源码运行必须用 pythonw，直接关联 .py 会按文件关联打开而失效）：
+# reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v MouseBatteryMonitor /t REG_SZ /d "\"<pythonw.exe路径>\" \"<本仓库路径>\main.py""
+
 python main.py --settings # 打开设置窗口
 python main.py --smoke-test # 无头自检
 ```
